@@ -14,6 +14,7 @@ import (
 	"github.com/miekg/dns"
 	api "k8s.io/api/core/v1"
 	discovery "k8s.io/api/discovery/v1"
+	fakecrd "k8s.io/apiextensions-apiserver/pkg/client/clientset/clientset/fake"
 	meta "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/kubernetes/fake"
@@ -30,11 +31,12 @@ func inc(ip net.IP) {
 
 func kubernetesWithFakeClient(ctx context.Context, zone, cidr string, initEndpointsCache bool, svcType string) *Kubernetes {
 	client := fake.NewSimpleClientset()
+	fcrdClient := fakecrd.NewSimpleClientset()
 	dco := dnsControlOpts{
 		zones:              []string{zone},
 		initEndpointsCache: initEndpointsCache,
 	}
-	controller := newdnsController(ctx, client, dco)
+	controller := newdnsController(ctx, client, fcrdClient, dco)
 
 	// Add resources
 	_, err := client.CoreV1().Namespaces().Create(ctx, &api.Namespace{ObjectMeta: meta.ObjectMeta{Name: "testns"}}, meta.CreateOptions{})

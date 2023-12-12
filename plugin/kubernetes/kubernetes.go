@@ -15,9 +15,11 @@ import (
 	"github.com/coredns/coredns/plugin/pkg/dnsutil"
 	"github.com/coredns/coredns/plugin/pkg/fall"
 	"github.com/coredns/coredns/request"
+	gtwapi "sigs.k8s.io/gateway-api/apis/v1"
 
 	"github.com/miekg/dns"
 	api "k8s.io/api/core/v1"
+	crd "k8s.io/apiextensions-apiserver/pkg/client/clientset/clientset"
 	meta "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/client-go/kubernetes"
@@ -78,6 +80,13 @@ const (
 	Svc = "svc"
 	// Pod is the DNS schema for kubernetes pods
 	Pod = "pod"
+	// Gateway is the DNS schema for gateways
+	// TODO: Figure out if we actually want this to be a schema
+	// There's definitely something intriguing about this pattern; we have schemas
+	// for pods and services, so it may make sense to have a schema for the L7
+	// upgrade path via gateways
+	//nolint:unused
+	Gateway = "gateway"
 	// defaultTTL to apply to all answers.
 	defaultTTL = 5
 )
@@ -233,6 +242,11 @@ func (k *Kubernetes) InitKubeCache(ctx context.Context) (onStart func() error, o
 		return nil, nil, fmt.Errorf("failed to create kubernetes notification controller: %q", err)
 	}
 
+	crdClient, err := crd.NewForConfig(config)
+	if err != nil {
+		return nil, nil, fmt.Errorf("failed to create kubernetes notification controller: %q", err)
+	}
+
 	if k.opts.labelSelector != nil {
 		var selector labels.Selector
 		selector, err = meta.LabelSelectorAsSelector(k.opts.labelSelector)
@@ -256,7 +270,7 @@ func (k *Kubernetes) InitKubeCache(ctx context.Context) (onStart func() error, o
 	k.opts.zones = k.Zones
 	k.opts.endpointNameMode = k.endpointNameMode
 
-	k.APIConn = newdnsController(ctx, kubeClient, k.opts)
+	k.APIConn = newdnsController(ctx, kubeClient, crdClient, k.opts)
 
 	onStart = func() error {
 		go func() {
@@ -416,13 +430,65 @@ func (k *Kubernetes) findServices(r recordRequest, zone string) (services []msg.
 		endpointsListFunc func() []*object.Endpoints
 		endpointsList     []*object.Endpoints
 		serviceList       []*object.Service
+		gatewayList       []*object.Gateway
 	)
 
 	idx := object.ServiceKey(r.service, r.namespace)
+	gatewayIdx := object.GatewayKey(r.service, r.namespace)
 	serviceList = k.APIConn.SvcIndex(idx)
+	gatewayList = k.APIConn.GatewayAddressIndex(gatewayIdx)
 	endpointsListFunc = func() []*object.Endpoints { return k.APIConn.EpIndex(idx) }
 
 	zonePath := msg.Path(zone, coredns)
+
+	// keithmattix: Check gatewayList first since we haven't figured out how to solve conflicts yet
+	// Yes, you read that right; this is a toy
+	// TODO: Figure out naming conflicts between services and gateways.
+	// We definitely can't block conflicts at this points, but maybe service just takes precendence?
+	// Or gateways live in a different zone?
+	svcMap := make(map[string]struct{})
+	for _, gw := range gatewayList {
+		accepted := false
+		for _, cond := range gw.Status.Conditions {
+			if cond.Type != string(gtwapi.GatewayConditionAccepted) {
+				continue
+			}
+			accepted = cond.Status == meta.ConditionTrue
+		}
+
+		// Only accepted gateways should have DNS resolved
+		if !accepted {
+			continue
+		}
+		if !(match(r.namespace, gw.Namespace) && match(r.service, gw.Name)) {
+			continue
+		}
+
+		// Don't do the empty service check because we'll do it later on in the second loop
+
+		// ClusterIP service
+		for _, l := range gw.Listeners {
+			// keithmattix: Named ports are somewhat functionally equivalent to listeners but not semantically
+			// (i.e. there's no defined SRV record convention for listeners).
+			// TODO: Figure out if there should be SRV records for listener ports.
+			if !(matchPortAndProtocol(r.port, string(l.Name), r.protocol, string(l.Protocol))) {
+				continue
+			}
+
+			err = nil
+
+			for _, addr := range gw.Status.Addresses {
+				if *addr.Type != gtwapi.IPAddressType {
+					continue
+				}
+				s := msg.Service{Host: addr.Value, Port: int(l.Port), TTL: k.ttl}
+				// TODO: Use special gateway path instead of .svc.ZONE
+				s.Key = strings.Join([]string{zonePath, Svc, gw.Namespace, gw.Name}, "/")
+				services = append(services, s)
+				svcMap[s.Key] = struct{}{}
+			}
+		}
+	}
 	for _, svc := range serviceList {
 		if !(match(r.namespace, svc.Namespace) && match(r.service, svc.Name)) {
 			continue
@@ -505,8 +571,12 @@ func (k *Kubernetes) findServices(r recordRequest, zone string) (services []msg.
 			err = nil
 
 			for _, ip := range svc.ClusterIPs {
+				svcKey := strings.Join([]string{zonePath, Svc, svc.Namespace, svc.Name}, "/")
+				if _, ok := svcMap[svcKey]; ok {
+					continue // There's already a Gateway svc created; assume user wants to always use that instead
+				}
 				s := msg.Service{Host: ip, Port: int(p.Port), TTL: k.ttl}
-				s.Key = strings.Join([]string{zonePath, Svc, svc.Namespace, svc.Name}, "/")
+				s.Key = svcKey
 				services = append(services, s)
 			}
 		}

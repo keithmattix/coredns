@@ -281,12 +281,14 @@ var tests = []test.Case{
 
 type external struct{}
 
-func (external) HasSynced() bool                           { return true }
-func (external) Run()                                      {}
-func (external) Stop() error                               { return nil }
-func (external) EpIndexReverse(string) []*object.Endpoints { return nil }
-func (external) SvcIndexReverse(string) []*object.Service  { return nil }
-func (external) Modified(bool) int64                       { return 0 }
+func (external) HasSynced() bool                              { return true }
+func (external) Run()                                         {}
+func (external) Stop() error                                  { return nil }
+func (external) EpIndexReverse(string) []*object.Endpoints    { return nil }
+func (external) SvcIndexReverse(string) []*object.Service     { return nil }
+func (external) GatewayAddressIndex(string) []*object.Gateway { return nil }
+func (external) GatewayIndex(string) []*object.Gateway        { return nil }
+func (external) Modified(bool) int64                          { return 0 }
 func (external) EpIndex(s string) []*object.Endpoints {
 	return epIndexExternal[s]
 }

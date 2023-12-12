@@ -12,26 +12,35 @@ import (
 
 	api "k8s.io/api/core/v1"
 	discovery "k8s.io/api/discovery/v1"
+	apiextensionsv1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
+	crdclientset "k8s.io/apiextensions-apiserver/pkg/client/clientset/clientset"
 	meta "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/watch"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/tools/cache"
+	gtwapi "sigs.k8s.io/gateway-api/apis/v1"
+	gtwapiclientset "sigs.k8s.io/gateway-api/pkg/client/clientset/versioned"
 )
 
 const (
-	podIPIndex            = "PodIP"
-	svcNameNamespaceIndex = "ServiceNameNamespace"
-	svcIPIndex            = "ServiceIP"
-	svcExtIPIndex         = "ServiceExternalIP"
-	epNameNamespaceIndex  = "EndpointNameNamespace"
-	epIPIndex             = "EndpointsIP"
+	podIPIndex                = "PodIP"
+	svcNameNamespaceIndex     = "ServiceNameNamespace"
+	svcIPIndex                = "ServiceIP"
+	svcExtIPIndex             = "ServiceExternalIP"
+	gatewayNameNamespaceIndex = "GatewayNameNamespace"
+	gatewayAddressIndex       = "GatewayAddress"
+	epNameNamespaceIndex      = "EndpointNameNamespace"
+	epIPIndex                 = "EndpointsIP"
+	kubeServiceCRDName        = "gateways.gateway.networking.k8s.io"
 )
 
 type dnsController interface {
 	ServiceList() []*object.Service
 	EndpointsList() []*object.Endpoints
+	GatewayIndex(string) []*object.Gateway
+	GatewayAddressIndex(ip string) []*object.Gateway
 	SvcIndex(string) []*object.Service
 	SvcIndexReverse(string) []*object.Service
 	SvcExtIndexReverse(string) []*object.Service
@@ -60,20 +69,27 @@ type dnsControl struct {
 	// services with external facing IP addresses
 	extModified int64
 
-	client kubernetes.Interface
+	client    kubernetes.Interface
+	crdClient crdclientset.Interface
+	gtwClient gtwapiclientset.Interface
 
 	selector          labels.Selector
 	namespaceSelector labels.Selector
 
-	svcController cache.Controller
-	podController cache.Controller
-	epController  cache.Controller
-	nsController  cache.Controller
+	svcController            cache.Controller
+	podController            cache.Controller
+	epController             cache.Controller
+	nsController             cache.Controller
+	crdController            cache.Controller
+	gatewayController        cache.Controller
+	gatewayControllerStarted atomic.Bool
 
-	svcLister cache.Indexer
-	podLister cache.Indexer
-	epLister  cache.Indexer
-	nsLister  cache.Store
+	svcLister     cache.Indexer
+	gatewayLister cache.Indexer
+	crdLister     cache.Indexer
+	podLister     cache.Indexer
+	epLister      cache.Indexer
+	nsLister      cache.Store
 
 	// stopLock is used to enforce only a single call to Stop is active.
 	// Needed because we allow stopping through an http endpoint and
@@ -90,6 +106,7 @@ type dnsControlOpts struct {
 	initPodCache       bool
 	initEndpointsCache bool
 	ignoreEmptyService bool
+	readGatewayAPI     bool
 
 	// Label handling.
 	labelSelector          *meta.LabelSelector
@@ -102,7 +119,7 @@ type dnsControlOpts struct {
 }
 
 // newdnsController creates a controller for CoreDNS.
-func newdnsController(ctx context.Context, kubeClient kubernetes.Interface, opts dnsControlOpts) *dnsControl {
+func newdnsController(ctx context.Context, kubeClient kubernetes.Interface, crdClient crdclientset.Interface, opts dnsControlOpts) *dnsControl {
 	dns := dnsControl{
 		client:            kubeClient,
 		selector:          opts.selector,
@@ -110,6 +127,11 @@ func newdnsController(ctx context.Context, kubeClient kubernetes.Interface, opts
 		stopCh:            make(chan struct{}),
 		zones:             opts.zones,
 		endpointNameMode:  opts.endpointNameMode,
+	}
+
+	if opts.readGatewayAPI {
+		setupGatewayController(ctx, kubeClient, &dns)
+		go dns.crdController.Run(dns.stopCh)
 	}
 
 	dns.svcLister, dns.svcController = object.NewIndexerInformer(
@@ -218,6 +240,31 @@ func svcNameNamespaceIndexFunc(obj interface{}) ([]string, error) {
 	return []string{s.Index}, nil
 }
 
+func gatewayNameNamespaceIndexFunc(obj interface{}) ([]string, error) {
+	s, ok := obj.(*object.Gateway)
+	if !ok {
+		return nil, errObj
+	}
+	return []string{s.Index}, nil
+}
+
+func gatewayAddressIndexFunc(obj interface{}) ([]string, error) {
+	gateway, ok := obj.(*object.Gateway)
+	if !ok {
+		return nil, errObj
+	}
+	idx := []string{}
+	for _, addr := range gateway.Status.Addresses {
+		// find all of the addresses that are IP addresses
+		if *addr.Type != gtwapi.IPAddressType {
+			continue
+		}
+
+		idx = append(idx, addr.Value)
+	}
+	return idx, nil
+}
+
 func epNameNamespaceIndexFunc(obj interface{}) ([]string, error) {
 	s, ok := obj.(*object.Endpoints)
 	if !ok {
@@ -234,12 +281,98 @@ func epIPIndexFunc(obj interface{}) ([]string, error) {
 	return ep.IndexIP, nil
 }
 
+func setupGatewayController(ctx context.Context, c kubernetes.Interface, dns *dnsControl) {
+	var stop chan struct{}
+	reh := cache.ResourceEventHandlerFuncs{
+		AddFunc: func(obj interface{}) {
+			crd, ok := obj.(*apiextensionsv1.CustomResourceDefinition)
+			if !ok {
+				log.Errorf("Expected CustomResourceDefinition but got %T", obj)
+				return
+			}
+
+			//TODO: Maybe we need to wait for a specific gatewayclass?
+			if crd.Spec.Group != "gateway.networking.k8s.io" || crd.Name != kubeServiceCRDName {
+				log.Debugf("Ignoring CustomResourceDefinition %s/%s because it is not a k8s gateway", crd.Spec.Group, crd.Name)
+				return
+			}
+
+			// This is the gateway CRD; start the controller
+			stop = make(chan struct{}) // always re-init the stop chan since it could've been closed after a previous controller run
+			if !dns.gatewayControllerStarted.Load() {
+				dns.gatewayLister, dns.gatewayController = object.NewIndexerInformer(
+					&cache.ListWatch{
+						ListFunc:  gatewayListFunc(ctx, dns.gtwClient, api.NamespaceAll, dns.selector),
+						WatchFunc: gatewayWatchFunc(ctx, dns.gtwClient, api.NamespaceAll, dns.selector),
+					},
+					&gtwapi.Gateway{},
+					cache.ResourceEventHandlerFuncs{AddFunc: dns.Add, UpdateFunc: dns.Update, DeleteFunc: dns.Delete}, // should match service handling
+					cache.Indexers{gatewayNameNamespaceIndex: gatewayNameNamespaceIndexFunc, gatewayAddressIndex: gatewayAddressIndexFunc},
+					object.DefaultProcessor(object.ToGateway, nil),
+				)
+				dns.gatewayControllerStarted.Store(true)
+				go dns.gatewayController.Run(stop)
+			}
+		},
+		DeleteFunc: func(obj interface{}) {
+			crd, ok := obj.(*apiextensionsv1.CustomResourceDefinition)
+			if !ok {
+				log.Errorf("Expected CustomResourceDefinition but got %T", obj)
+				return
+			}
+
+			//TODO: Maybe we need to wait for a specific gatewayclass?
+			if crd.Spec.Group != "gateway.networking.k8s.io" || crd.Name != kubeServiceCRDName {
+				log.Debugf("Ignoring CustomResourceDefinition %s/%s because it is not a k8s gateway", crd.Spec.Group, crd.Name)
+				return
+			}
+
+			// The gateway CRD was deleted; stop the gateway controller
+			if dns.gatewayControllerStarted.Load() {
+				// If the controller is running, stop it
+				close(stop)
+				dns.gatewayControllerStarted.Store(false)
+			}
+		},
+		UpdateFunc: func(oldObj, newObj interface{}) {
+			// TODO: figure out if we actually care about this?
+		},
+	}
+	dns.crdLister, dns.crdController = object.NewIndexerInformer(
+		&cache.ListWatch{
+			ListFunc:  crdListFunc(ctx, dns.crdClient),
+			WatchFunc: crdWatchFunc(ctx, dns.crdClient),
+		},
+		&apiextensionsv1.CustomResourceDefinition{},
+		reh,
+		cache.Indexers{},
+		object.DefaultProcessor(object.ToCustomResourceDefinition, nil),
+	)
+
+	go dns.crdController.Run(dns.stopCh)
+}
+
 func serviceListFunc(ctx context.Context, c kubernetes.Interface, ns string, s labels.Selector) func(meta.ListOptions) (runtime.Object, error) {
 	return func(opts meta.ListOptions) (runtime.Object, error) {
 		if s != nil {
 			opts.LabelSelector = s.String()
 		}
 		return c.CoreV1().Services(ns).List(ctx, opts)
+	}
+}
+
+func gatewayListFunc(ctx context.Context, c gtwapiclientset.Interface, ns string, s labels.Selector) func(meta.ListOptions) (runtime.Object, error) {
+	return func(opts meta.ListOptions) (runtime.Object, error) {
+		if s != nil {
+			opts.LabelSelector = s.String()
+		}
+		return c.GatewayV1().Gateways(ns).List(ctx, opts)
+	}
+}
+
+func crdListFunc(ctx context.Context, c crdclientset.Interface) func(meta.ListOptions) (runtime.Object, error) {
+	return func(opts meta.ListOptions) (runtime.Object, error) {
+		return c.ApiextensionsV1().CustomResourceDefinitions().List(ctx, opts)
 	}
 }
 
@@ -280,6 +413,22 @@ func serviceWatchFunc(ctx context.Context, c kubernetes.Interface, ns string, s 
 			options.LabelSelector = s.String()
 		}
 		return c.CoreV1().Services(ns).Watch(ctx, options)
+	}
+}
+
+func crdWatchFunc(ctx context.Context, c crdclientset.Interface) func(options meta.ListOptions) (watch.Interface, error) {
+	return func(options meta.ListOptions) (watch.Interface, error) {
+		return c.ApiextensionsV1().CustomResourceDefinitions().Watch(ctx, options)
+	}
+}
+
+func gatewayWatchFunc(ctx context.Context, c gtwapiclientset.Interface, ns string, s labels.Selector) func(options meta.ListOptions) (watch.Interface, error) {
+	return func(options meta.ListOptions) (watch.Interface, error) {
+		if s != nil {
+			options.LabelSelector = s.String()
+		}
+
+		return c.GatewayV1().Gateways(ns).Watch(ctx, options)
 	}
 }
 
@@ -357,6 +506,11 @@ func (dns *dnsControl) HasSynced() bool {
 		c = dns.podController.HasSynced()
 	}
 	d := dns.nsController.HasSynced()
+
+	if dns.gatewayControllerStarted.Load() {
+		e := dns.gatewayController.HasSynced()
+		return a && b && c && d && e
+	}
 	return a && b && c && d
 }
 
@@ -370,6 +524,18 @@ func (dns *dnsControl) ServiceList() (svcs []*object.Service) {
 		svcs = append(svcs, s)
 	}
 	return svcs
+}
+
+func (dns *dnsControl) GatewayList() (gateways []*object.Gateway) {
+	os := dns.gatewayLister.List()
+	for _, o := range os {
+		gw, ok := o.(*object.Gateway)
+		if !ok {
+			continue
+		}
+		gateways = append(gateways, gw)
+	}
+	return gateways
 }
 
 func (dns *dnsControl) EndpointsList() (eps []*object.Endpoints) {
@@ -412,6 +578,36 @@ func (dns *dnsControl) SvcIndex(idx string) (svcs []*object.Service) {
 		svcs = append(svcs, s)
 	}
 	return svcs
+}
+
+func (dns *dnsControl) GatewayIndex(idx string) (gateways []*object.Gateway) {
+	os, err := dns.gatewayLister.ByIndex(gatewayNameNamespaceIndex, idx)
+	if err != nil {
+		return nil
+	}
+	for _, o := range os {
+		gw, ok := o.(*object.Gateway)
+		if !ok {
+			continue
+		}
+		gateways = append(gateways, gw)
+	}
+	return gateways
+}
+
+func (dns *dnsControl) GatewayAddressIndex(ip string) (gateways []*object.Gateway) {
+	os, err := dns.gatewayLister.ByIndex(gatewayAddressIndex, ip)
+	if err != nil {
+		return nil
+	}
+	for _, o := range os {
+		gw, ok := o.(*object.Gateway)
+		if !ok {
+			continue
+		}
+		gateways = append(gateways, gw)
+	}
+	return gateways
 }
 
 func (dns *dnsControl) SvcIndexReverse(ip string) (svcs []*object.Service) {
