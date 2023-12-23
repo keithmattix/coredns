@@ -18,6 +18,7 @@ import (
 	meta "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/kubernetes/fake"
+	fakegtw "sigs.k8s.io/gateway-api/pkg/client/clientset/versioned/fake"
 )
 
 func inc(ip net.IP) {
@@ -32,11 +33,12 @@ func inc(ip net.IP) {
 func kubernetesWithFakeClient(ctx context.Context, zone, cidr string, initEndpointsCache bool, svcType string) *Kubernetes {
 	client := fake.NewSimpleClientset()
 	fcrdClient := fakecrd.NewSimpleClientset()
+	fgtwClient := fakegtw.NewSimpleClientset()
 	dco := dnsControlOpts{
 		zones:              []string{zone},
 		initEndpointsCache: initEndpointsCache,
 	}
-	controller := newdnsController(ctx, client, fcrdClient, dco)
+	controller := newdnsController(ctx, client, fcrdClient, fgtwClient, dco)
 
 	// Add resources
 	_, err := client.CoreV1().Namespaces().Create(ctx, &api.Namespace{ObjectMeta: meta.ObjectMeta{Name: "testns"}}, meta.CreateOptions{})

@@ -100,6 +100,7 @@ type dnsControl struct {
 
 	zones            []string
 	endpointNameMode bool
+	readGatewayAPI   bool
 }
 
 type dnsControlOpts struct {
@@ -119,19 +120,21 @@ type dnsControlOpts struct {
 }
 
 // newdnsController creates a controller for CoreDNS.
-func newdnsController(ctx context.Context, kubeClient kubernetes.Interface, crdClient crdclientset.Interface, opts dnsControlOpts) *dnsControl {
+func newdnsController(ctx context.Context, kubeClient kubernetes.Interface, crdClient crdclientset.Interface, gtwClient gtwapiclientset.Interface, opts dnsControlOpts) *dnsControl {
 	dns := dnsControl{
 		client:            kubeClient,
+		crdClient:         crdClient,
+		gtwClient:         gtwClient,
 		selector:          opts.selector,
 		namespaceSelector: opts.namespaceSelector,
 		stopCh:            make(chan struct{}),
 		zones:             opts.zones,
 		endpointNameMode:  opts.endpointNameMode,
+		readGatewayAPI:    opts.readGatewayAPI,
 	}
 
-	if opts.readGatewayAPI {
+	if dns.readGatewayAPI {
 		setupGatewayController(ctx, kubeClient, &dns)
-		go dns.crdController.Run(dns.stopCh)
 	}
 
 	dns.svcLister, dns.svcController = object.NewIndexerInformer(
@@ -285,15 +288,17 @@ func setupGatewayController(ctx context.Context, c kubernetes.Interface, dns *dn
 	var stop chan struct{}
 	reh := cache.ResourceEventHandlerFuncs{
 		AddFunc: func(obj interface{}) {
-			crd, ok := obj.(*apiextensionsv1.CustomResourceDefinition)
+			log.Debug("Got a new CRD")
+			crd, ok := obj.(*object.CustomResourceDefinition)
 			if !ok {
 				log.Errorf("Expected CustomResourceDefinition but got %T", obj)
 				return
 			}
 
 			//TODO: Maybe we need to wait for a specific gatewayclass?
-			if crd.Spec.Group != "gateway.networking.k8s.io" || crd.Name != kubeServiceCRDName {
-				log.Debugf("Ignoring CustomResourceDefinition %s/%s because it is not a k8s gateway", crd.Spec.Group, crd.Name)
+
+			if crd.Group != "gateway.networking.k8s.io" || crd.Name != kubeServiceCRDName {
+				log.Debugf("Ignoring CustomResourceDefinition %s/%s because it is not a k8s gateway", crd.Group, crd.Name)
 				return
 			}
 
@@ -315,15 +320,15 @@ func setupGatewayController(ctx context.Context, c kubernetes.Interface, dns *dn
 			}
 		},
 		DeleteFunc: func(obj interface{}) {
-			crd, ok := obj.(*apiextensionsv1.CustomResourceDefinition)
+			crd, ok := obj.(*object.CustomResourceDefinition)
 			if !ok {
-				log.Errorf("Expected CustomResourceDefinition but got %T", obj)
+				log.Errorf("Expected object.CustomResourceDefinition but got %T", obj)
 				return
 			}
 
 			//TODO: Maybe we need to wait for a specific gatewayclass?
-			if crd.Spec.Group != "gateway.networking.k8s.io" || crd.Name != kubeServiceCRDName {
-				log.Debugf("Ignoring CustomResourceDefinition %s/%s because it is not a k8s gateway", crd.Spec.Group, crd.Name)
+			if crd.Group != "gateway.networking.k8s.io" || crd.Name != kubeServiceCRDName {
+				log.Debugf("Ignoring CustomResourceDefinition %s/%s because it is not a k8s gateway", crd.Group, crd.Name)
 				return
 			}
 
@@ -581,6 +586,9 @@ func (dns *dnsControl) SvcIndex(idx string) (svcs []*object.Service) {
 }
 
 func (dns *dnsControl) GatewayIndex(idx string) (gateways []*object.Gateway) {
+	if !dns.readGatewayAPI || dns.gatewayLister == nil {
+		return nil
+	}
 	os, err := dns.gatewayLister.ByIndex(gatewayNameNamespaceIndex, idx)
 	if err != nil {
 		return nil
@@ -596,6 +604,10 @@ func (dns *dnsControl) GatewayIndex(idx string) (gateways []*object.Gateway) {
 }
 
 func (dns *dnsControl) GatewayAddressIndex(ip string) (gateways []*object.Gateway) {
+	if !dns.readGatewayAPI || dns.gatewayLister == nil {
+		return nil
+	}
+	log.Debugf("Looking up gateway for address %s", ip)
 	os, err := dns.gatewayLister.ByIndex(gatewayAddressIndex, ip)
 	if err != nil {
 		return nil
@@ -719,6 +731,11 @@ func (dns *dnsControl) detectChanges(oldObj, newObj interface{}) {
 		if emod {
 			dns.updateExtModified()
 		}
+	case *object.Gateway:
+		imod, _ := gatewayModified(oldObj, newObj)
+		if imod {
+			dns.updateModified()
+		}
 	case *object.Pod:
 		dns.updateModified()
 	case *object.Endpoints:
@@ -792,8 +809,65 @@ func endpointsEquivalent(a, b *object.Endpoints) bool {
 	return true
 }
 
+// gatewayModified chcks the gateways passed for changes that result to changes
+// to internal and/or external records. It returns two booleans, one for internal
+// record changes, and a second for external record changes
+func gatewayModified(oldObj, newObj interface{}) (intGtw, extGtw bool) {
+	extGtw = false // TODO: implement external gateway records for this POC
+
+	newGtw := newObj.(*object.Gateway)
+	oldGtw := oldObj.(*object.Gateway)
+
+	if len(oldGtw.Status.Addresses) != len(newGtw.Status.Addresses) {
+		intGtw = true
+	}
+
+	if intGtw {
+		return
+	}
+
+	if len(oldGtw.Listeners) != len(newGtw.Listeners) {
+		intGtw = true
+	}
+
+	if len(oldGtw.Status.Listeners) != len(newGtw.Status.Listeners) {
+		intGtw = true
+	}
+
+	for i := range oldGtw.Listeners {
+		if oldGtw.Listeners[i].Port != newGtw.Listeners[i].Port {
+			intGtw = true
+			break
+		}
+		if oldGtw.Listeners[i].Protocol != newGtw.Listeners[i].Protocol {
+			intGtw = true
+			break
+		}
+		if oldGtw.Listeners[i].Name != newGtw.Listeners[i].Name {
+			intGtw = true
+			break
+		}
+		if oldGtw.Listeners[i].Hostname != newGtw.Listeners[i].Hostname {
+			intGtw = true
+			break
+		}
+		listenerName := oldGtw.Listeners[i].Name
+		if len(oldGtw.ListenerStatusMap[listenerName]) != len(newGtw.ListenerStatusMap[listenerName]) {
+			intGtw = true
+			break
+		}
+		for t, c := range oldGtw.ListenerStatusMap[listenerName] {
+			if c != newGtw.ListenerStatusMap[listenerName][t] {
+				intGtw = true
+				break
+			}
+		}
+	}
+	return
+}
+
 // serviceModified checks the services passed for changes that result in changes
-// to internal and or external records.  It returns two booleans, one for internal
+// to internal and or external records. It returns two booleans, one for internal
 // record changes, and a second for external record changes
 func serviceModified(oldObj, newObj interface{}) (intSvc, extSvc bool) {
 	if oldObj != nil && newObj == nil {

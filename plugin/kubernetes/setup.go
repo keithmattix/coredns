@@ -229,6 +229,8 @@ func ParseStanza(c *caddy.Controller) (*Kubernetes, error) {
 				overrides,
 			)
 			k8s.ClientConfig = config
+		case "gateway":
+			k8s.opts.readGatewayAPI = true
 		default:
 			return nil, c.Errf("unknown property '%s'", c.Val())
 		}

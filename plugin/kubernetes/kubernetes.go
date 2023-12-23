@@ -26,6 +26,7 @@ import (
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/clientcmd"
 	clientcmdapi "k8s.io/client-go/tools/clientcmd/api"
+	gtw "sigs.k8s.io/gateway-api/pkg/client/clientset/versioned"
 )
 
 // Kubernetes implements a plugin that connects to a Kubernetes cluster.
@@ -247,6 +248,8 @@ func (k *Kubernetes) InitKubeCache(ctx context.Context) (onStart func() error, o
 		return nil, nil, fmt.Errorf("failed to create kubernetes notification controller: %q", err)
 	}
 
+	gtwClient, err := gtw.NewForConfig(config)
+
 	if k.opts.labelSelector != nil {
 		var selector labels.Selector
 		selector, err = meta.LabelSelectorAsSelector(k.opts.labelSelector)
@@ -270,7 +273,7 @@ func (k *Kubernetes) InitKubeCache(ctx context.Context) (onStart func() error, o
 	k.opts.zones = k.Zones
 	k.opts.endpointNameMode = k.endpointNameMode
 
-	k.APIConn = newdnsController(ctx, kubeClient, crdClient, k.opts)
+	k.APIConn = newdnsController(ctx, kubeClient, crdClient, gtwClient, k.opts)
 
 	onStart = func() error {
 		go func() {
@@ -436,7 +439,7 @@ func (k *Kubernetes) findServices(r recordRequest, zone string) (services []msg.
 	idx := object.ServiceKey(r.service, r.namespace)
 	gatewayIdx := object.GatewayKey(r.service, r.namespace)
 	serviceList = k.APIConn.SvcIndex(idx)
-	gatewayList = k.APIConn.GatewayAddressIndex(gatewayIdx)
+	gatewayList = k.APIConn.GatewayIndex(gatewayIdx)
 	endpointsListFunc = func() []*object.Endpoints { return k.APIConn.EpIndex(idx) }
 
 	zonePath := msg.Path(zone, coredns)
@@ -448,16 +451,17 @@ func (k *Kubernetes) findServices(r recordRequest, zone string) (services []msg.
 	// Or gateways live in a different zone?
 	svcMap := make(map[string]struct{})
 	for _, gw := range gatewayList {
-		accepted := false
+		programmed := false
 		for _, cond := range gw.Status.Conditions {
-			if cond.Type != string(gtwapi.GatewayConditionAccepted) {
+			if cond.Type != string(gtwapi.GatewayConditionProgrammed) {
 				continue
 			}
-			accepted = cond.Status == meta.ConditionTrue
+			programmed = cond.Status == meta.ConditionTrue
+			break
 		}
 
-		// Only accepted gateways should have DNS resolved
-		if !accepted {
+		// Only programmed gateways should have DNS resolved
+		if !programmed {
 			continue
 		}
 		if !(match(r.namespace, gw.Namespace) && match(r.service, gw.Name)) {
@@ -573,6 +577,7 @@ func (k *Kubernetes) findServices(r recordRequest, zone string) (services []msg.
 			for _, ip := range svc.ClusterIPs {
 				svcKey := strings.Join([]string{zonePath, Svc, svc.Namespace, svc.Name}, "/")
 				if _, ok := svcMap[svcKey]; ok {
+					log.Debugf("Skipping service %s/%s because it's already been added by a gateway", svc.Namespace, svc.Name)
 					continue // There's already a Gateway svc created; assume user wants to always use that instead
 				}
 				s := msg.Service{Host: ip, Port: int(p.Port), TTL: k.ttl}
