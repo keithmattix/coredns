@@ -55,7 +55,7 @@ func (k *Kubernetes) Metadata(ctx context.Context, state request.Request) contex
 	})
 
 	metadata.SetValueFunc(ctx, "kubernetes/kind", func() string {
-		return r.podOrSvc
+		return r.podOrSvcOrGateway
 	})
 
 	return ctx

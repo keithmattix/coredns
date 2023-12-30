@@ -230,7 +230,21 @@ func ParseStanza(c *caddy.Controller) (*Kubernetes, error) {
 			)
 			k8s.ClientConfig = config
 		case "gateway":
+			args := c.RemainingArgs()
+			if len(args) > 1 {
+				return nil, c.ArgErr()
+			}
 			k8s.opts.readGatewayAPI = true
+			if len(args) == 0 {
+				log.Debug("gateway mode enabled (no mirror)")
+				break
+			}
+			if args[0] == "mirror" {
+				log.Debug("gateway mirror mode enabled")
+				k8s.opts.mirrorGatewayToSvc = true
+			} else {
+				return nil, c.ArgErr()
+			}
 		default:
 			return nil, c.Errf("unknown property '%s'", c.Val())
 		}

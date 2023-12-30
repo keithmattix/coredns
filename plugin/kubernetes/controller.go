@@ -108,6 +108,7 @@ type dnsControlOpts struct {
 	initEndpointsCache bool
 	ignoreEmptyService bool
 	readGatewayAPI     bool
+	mirrorGatewayToSvc bool
 
 	// Label handling.
 	labelSelector          *meta.LabelSelector
@@ -296,7 +297,6 @@ func setupGatewayController(ctx context.Context, c kubernetes.Interface, dns *dn
 			}
 
 			//TODO: Maybe we need to wait for a specific gatewayclass?
-
 			if crd.Group != "gateway.networking.k8s.io" || crd.Name != kubeServiceCRDName {
 				log.Debugf("Ignoring CustomResourceDefinition %s/%s because it is not a k8s gateway", crd.Group, crd.Name)
 				return

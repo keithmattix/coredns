@@ -86,7 +86,6 @@ const (
 	// There's definitely something intriguing about this pattern; we have schemas
 	// for pods and services, so it may make sense to have a schema for the L7
 	// upgrade path via gateways
-	//nolint:unused
 	Gateway = "gateway"
 	// defaultTTL to apply to all answers.
 	defaultTTL = 5
@@ -316,7 +315,7 @@ func (k *Kubernetes) Records(ctx context.Context, state request.Request, exact b
 	if e != nil {
 		return nil, e
 	}
-	if r.podOrSvc == "" {
+	if r.podOrSvcOrGateway == "" {
 		return nil, nil
 	}
 
@@ -328,9 +327,14 @@ func (k *Kubernetes) Records(ctx context.Context, state request.Request, exact b
 		return nil, errNsNotExposed
 	}
 
-	if r.podOrSvc == Pod {
+	if r.podOrSvcOrGateway == Pod {
 		pods, err := k.findPods(r, state.Zone)
 		return pods, err
+	}
+
+	if r.podOrSvcOrGateway == Gateway {
+		gateways, err := k.findGateways(r, state.Zone)
+		return gateways, err
 	}
 
 	services, err := k.findServices(r, state.Zone)
@@ -411,6 +415,74 @@ func (k *Kubernetes) findPods(r recordRequest, zone string) (pods []msg.Service,
 	return pods, err
 }
 
+// findGateways returns the Gateway-generated services matching r from the cache.
+func (k *Kubernetes) findGateways(r recordRequest, zone string) (gateways []msg.Service, err error) {
+	if !k.namespaceExposed(r.namespace) {
+		return nil, errNoItems
+	}
+
+	// handle empty service name
+	if r.service == "" {
+		if k.namespaceExposed(r.namespace) {
+			// NODATA
+			return nil, nil
+		}
+		// NXDOMAIN
+		return nil, errNoItems
+	}
+
+	err = errNoItems
+
+	var gatewayList []*object.Gateway
+
+	gatewayIdx := object.GatewayKey(r.service, r.namespace)
+	gatewayList = k.APIConn.GatewayIndex(gatewayIdx)
+
+	zonePath := msg.Path(zone, coredns)
+
+	svcMap := make(map[string]struct{})
+	for _, gw := range gatewayList {
+		programmed := false
+		for _, cond := range gw.Status.Conditions {
+			if cond.Type != string(gtwapi.GatewayConditionProgrammed) {
+				continue
+			}
+			programmed = cond.Status == meta.ConditionTrue
+			break
+		}
+
+		// Only programmed gateways should have DNS resolved
+		if !programmed {
+			continue
+		}
+		if !(match(r.namespace, gw.Namespace) && match(r.service, gw.Name)) {
+			continue
+		}
+
+		// ClusterIP service
+		for _, l := range gw.Listeners {
+			if !(matchPortAndProtocol(r.port, string(l.Name), r.protocol, string(l.Protocol))) {
+				continue
+			}
+
+			err = nil
+
+			for _, addr := range gw.Status.Addresses {
+				if *addr.Type != gtwapi.IPAddressType {
+					continue
+				}
+
+				s := msg.Service{Host: addr.Value, Port: int(l.Port), TTL: k.ttl}
+				// e.g. cluster.local/gateway/default/foo or foo.default.gateway.cluster.local
+				s.Key = strings.Join([]string{zonePath, Gateway, gw.Namespace, gw.Name}, "/")
+				gateways = append(gateways, s)
+				svcMap[s.Key] = struct{}{}
+			}
+		}
+	}
+	return gateways, err
+}
+
 // findServices returns the services matching r from the cache.
 func (k *Kubernetes) findServices(r recordRequest, zone string) (services []msg.Service, err error) {
 	if !k.namespaceExposed(r.namespace) {
@@ -443,56 +515,52 @@ func (k *Kubernetes) findServices(r recordRequest, zone string) (services []msg.
 	endpointsListFunc = func() []*object.Endpoints { return k.APIConn.EpIndex(idx) }
 
 	zonePath := msg.Path(zone, coredns)
-
-	// keithmattix: Check gatewayList first since we haven't figured out how to solve conflicts yet
-	// Yes, you read that right; this is a toy
-	// TODO: Figure out naming conflicts between services and gateways.
-	// We definitely can't block conflicts at this points, but maybe service just takes precendence?
-	// Or gateways live in a different zone?
 	svcMap := make(map[string]struct{})
-	for _, gw := range gatewayList {
-		programmed := false
-		for _, cond := range gw.Status.Conditions {
-			if cond.Type != string(gtwapi.GatewayConditionProgrammed) {
-				continue
-			}
-			programmed = cond.Status == meta.ConditionTrue
-			break
-		}
 
-		// Only programmed gateways should have DNS resolved
-		if !programmed {
-			continue
-		}
-		if !(match(r.namespace, gw.Namespace) && match(r.service, gw.Name)) {
-			continue
-		}
-
-		// Don't do the empty service check because we'll do it later on in the second loop
-
-		// ClusterIP service
-		for _, l := range gw.Listeners {
-			// keithmattix: Named ports are somewhat functionally equivalent to listeners but not semantically
-			// (i.e. there's no defined SRV record convention for listeners).
-			// TODO: Figure out if there should be SRV records for listener ports.
-			if !(matchPortAndProtocol(r.port, string(l.Name), r.protocol, string(l.Protocol))) {
-				continue
-			}
-
-			err = nil
-
-			for _, addr := range gw.Status.Addresses {
-				if *addr.Type != gtwapi.IPAddressType {
+	// Check for gateway services first if mirroring is enabled
+	if k.opts.mirrorGatewayToSvc {
+		for _, gw := range gatewayList {
+			programmed := false
+			for _, cond := range gw.Status.Conditions {
+				if cond.Type != string(gtwapi.GatewayConditionProgrammed) {
 					continue
 				}
-				s := msg.Service{Host: addr.Value, Port: int(l.Port), TTL: k.ttl}
-				// TODO: Use special gateway path instead of .svc.ZONE
-				s.Key = strings.Join([]string{zonePath, Svc, gw.Namespace, gw.Name}, "/")
-				services = append(services, s)
-				svcMap[s.Key] = struct{}{}
+				programmed = cond.Status == meta.ConditionTrue
+				break
+			}
+
+			// Only programmed gateways should have DNS resolved
+			if !programmed {
+				continue
+			}
+			if !(match(r.namespace, gw.Namespace) && match(r.service, gw.Name)) {
+				continue
+			}
+
+			// Don't do the empty service check because we'll do it later on in the second loop
+
+			// ClusterIP service
+			for _, l := range gw.Listeners {
+				if !(matchPortAndProtocol(r.port, string(l.Name), r.protocol, string(l.Protocol))) {
+					continue
+				}
+
+				err = nil
+
+				for _, addr := range gw.Status.Addresses {
+					if *addr.Type != gtwapi.IPAddressType {
+						continue
+					}
+
+					s := msg.Service{Host: addr.Value, Port: int(l.Port), TTL: k.ttl}
+					s.Key = strings.Join([]string{zonePath, Svc, gw.Namespace, gw.Name}, "/")
+					services = append(services, s)
+					svcMap[s.Key] = struct{}{}
+				}
 			}
 		}
 	}
+
 	for _, svc := range serviceList {
 		if !(match(r.namespace, svc.Namespace) && match(r.service, svc.Name)) {
 			continue

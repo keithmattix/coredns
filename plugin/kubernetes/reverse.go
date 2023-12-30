@@ -28,7 +28,15 @@ func (k *Kubernetes) Reverse(ctx context.Context, state request.Request, exact b
 // serviceRecordForIP gets a service record with a cluster ip matching the ip argument
 // If a service cluster ip does not match, it checks all endpoints
 func (k *Kubernetes) serviceRecordForIP(ip, name string) []msg.Service {
-	// First check services with cluster ips
+	// First check Gateway addresses
+	for _, gw := range k.APIConn.GatewayAddressIndex(ip) {
+		if len(k.Namespaces) > 0 && !k.namespaceExposed(gw.Namespace) {
+			continue
+		}
+		domain := strings.Join([]string{gw.Name, gw.Namespace, Gateway, k.primaryZone()}, ".")
+		return []msg.Service{{Host: domain, TTL: k.ttl}}
+	}
+	// Then check services with cluster ips
 	for _, service := range k.APIConn.SvcIndexReverse(ip) {
 		if len(k.Namespaces) > 0 && !k.namespaceExposed(service.Namespace) {
 			continue

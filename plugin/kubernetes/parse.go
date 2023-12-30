@@ -18,8 +18,8 @@ type recordRequest struct {
 	service string
 	// The namespace used in Kubernetes.
 	namespace string
-	// A each name can be for a pod or a service, here we track what we've seen, either "pod" or "service".
-	podOrSvc string
+	// A each name can be for a pod or a service, here we track what we've seen, either "pod","service", or "gateway".
+	podOrSvcOrGateway string
 }
 
 // parseRequest parses the qname to find all the elements we need for querying k8s. Anything
@@ -30,10 +30,11 @@ func parseRequest(name, zone string) (r recordRequest, err error) {
 	// 1. _port._protocol.service.namespace.pod|svc.zone
 	// 2. (endpoint): endpoint.service.namespace.pod|svc.zone
 	// 3. (service): service.namespace.pod|svc.zone
+	// 4. (gateway): gateway.namespace.gtw.zone
 
 	base, _ := dnsutil.TrimZone(name, zone)
 	// return NODATA for apex queries
-	if base == "" || base == Svc || base == Pod {
+	if base == "" || base == Svc || base == Pod || base == Gateway {
 		return r, nil
 	}
 	segs := dns.SplitDomainName(base)
@@ -42,8 +43,8 @@ func parseRequest(name, zone string) (r recordRequest, err error) {
 	if last < 0 {
 		return r, nil
 	}
-	r.podOrSvc = segs[last]
-	if r.podOrSvc != Pod && r.podOrSvc != Svc {
+	r.podOrSvcOrGateway = segs[last]
+	if r.podOrSvcOrGateway != Pod && r.podOrSvcOrGateway != Svc && r.podOrSvcOrGateway != Gateway {
 		return r, errInvalidRequest
 	}
 	last--
@@ -98,6 +99,6 @@ func (r recordRequest) String() string {
 	s += "." + r.endpoint
 	s += "." + r.service
 	s += "." + r.namespace
-	s += "." + r.podOrSvc
+	s += "." + r.podOrSvcOrGateway
 	return s
 }
