@@ -43,3 +43,5 @@ kubectl exec -it $(kubectl get pod -l app=sleep -o jsonpath={.items..metadata.na
 ## TODO
 - [ ] Support for Hostname addresses
   - These should probably be CNAMEs to the hostname
+- [ ] Support for listener hostnames
+  - Maybe we just need guidance to always add a listener for the in-cluster DNS name (gateway schema)?
