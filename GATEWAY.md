@@ -39,3 +39,7 @@ Now, you can verify that the mirror is working as expected:
 ```bash
 kubectl exec -it $(kubectl get pod -l app=sleep -o jsonpath={.items..metadata.name}) -c sleep -- nslookup httpbin-gateway.default.svc.cluster.local
 ```
+
+## TODO
+- [ ] Support for Hostname addresses
+  - These should probably be CNAMEs to the hostname
