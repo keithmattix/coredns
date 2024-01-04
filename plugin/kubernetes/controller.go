@@ -341,6 +341,7 @@ func setupGatewayController(ctx context.Context, c kubernetes.Interface, dns *dn
 		},
 		UpdateFunc: func(oldObj, newObj interface{}) {
 			// TODO: figure out if we actually care about this?
+			// The only time we potentially do is when the gwapi gets upgraded
 		},
 	}
 	dns.crdLister, dns.crdController = object.NewIndexerInformer(
